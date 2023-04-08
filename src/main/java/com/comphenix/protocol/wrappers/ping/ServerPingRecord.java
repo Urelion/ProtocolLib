@@ -1,12 +1,12 @@
 package com.comphenix.protocol.wrappers.ping;
 
 import java.nio.charset.StandardCharsets;
-import java.util.Base64;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.Semaphore;
 
-import com.comphenix.protocol.events.AbstractStructure;
 import com.comphenix.protocol.events.InternalStructure;
+import com.comphenix.protocol.reflect.EquivalentConverter;
 import com.comphenix.protocol.reflect.StructureModifier;
 import com.comphenix.protocol.reflect.accessors.Accessors;
 import com.comphenix.protocol.reflect.accessors.ConstructorAccessor;
@@ -15,9 +15,10 @@ import com.comphenix.protocol.utility.MinecraftReflection;
 import com.comphenix.protocol.utility.MinecraftVersion;
 import com.comphenix.protocol.wrappers.*;
 
+import com.google.common.collect.ImmutableList;
 import org.bukkit.Bukkit;
 
-public class ServerPingRecord implements ServerPingImpl {
+public final class ServerPingRecord implements ServerPingImpl {
 	private static Class<?> SERVER_PING;
 	private static Class<?> PLAYER_SAMPLE_CLASS;
 	private static Class<?> SERVER_DATA_CLASS;
@@ -26,29 +27,41 @@ public class ServerPingRecord implements ServerPingImpl {
 
 	private static ConstructorAccessor PING_CTOR;
 
+	private static EquivalentConverter<List<WrappedGameProfile>> PROFILE_LIST_CONVERTER;
+
 	private static boolean initialized = false;
+	private static final Object lock = new Object();
 
 	private static void initialize() {
 		if (initialized) {
 			return;
 		}
 
-		initialized = true;
+		synchronized (lock) {
+			// may have been initialized while waiting for the lock
+			if (initialized) {
+				return;
+			}
 
-		try {
-			SERVER_PING = MinecraftReflection.getServerPingClass();
-			PLAYER_SAMPLE_CLASS = MinecraftReflection.getServerPingPlayerSampleClass();
-			SERVER_DATA_CLASS = MinecraftReflection.getServerPingServerDataClass();
+			try {
+				SERVER_PING = MinecraftReflection.getServerPingClass();
+				PLAYER_SAMPLE_CLASS = MinecraftReflection.getServerPingPlayerSampleClass();
+				SERVER_DATA_CLASS = MinecraftReflection.getServerPingServerDataClass();
 
-			PING_CTOR = Accessors.getConstructorAccessor(SERVER_PING.getConstructors()[0]);
+				PING_CTOR = Accessors.getConstructorAccessor(SERVER_PING.getConstructors()[0]);
 
-			DATA_WRAPPER = AutoWrapper.wrap(ServerData.class, SERVER_DATA_CLASS);
-			SAMPLE_WRAPPER = AutoWrapper.wrap(PlayerSample.class, PLAYER_SAMPLE_CLASS);
-			FAVICON_WRAPPER = AutoWrapper.wrap(Favicon.class, MinecraftReflection.getMinecraftClass("network.protocol.status.ServerPing$a"));
+				DATA_WRAPPER = AutoWrapper.wrap(ServerData.class, SERVER_DATA_CLASS);
+				SAMPLE_WRAPPER = AutoWrapper.wrap(PlayerSample.class, PLAYER_SAMPLE_CLASS);
+				FAVICON_WRAPPER = AutoWrapper.wrap(Favicon.class, MinecraftReflection.getMinecraftClass("network.protocol.status.ServerPing$a"));
 
-			DEFAULT_DESCRIPTION = WrappedChatComponent.fromLegacyText("A Minecraft Server");
-		} catch (Exception ex) {
-			ex.printStackTrace(); // TODO
+				PROFILE_LIST_CONVERTER = BukkitConverters.getListConverter(BukkitConverters.getWrappedGameProfileConverter());
+
+				DEFAULT_DESCRIPTION = WrappedChatComponent.fromLegacyText("A Minecraft Server");
+			} catch (Exception ex) {
+				throw new RuntimeException("Failed to initialize Server Ping", ex);
+			} finally {
+				initialized = true;
+			}
 		}
 	}
 
@@ -56,15 +69,44 @@ public class ServerPingRecord implements ServerPingImpl {
 		public int max;
 		public int online;
 		public Object sample;
+
+		public PlayerSample(int max, int online, Object sample) {
+			this.max = max;
+			this.online = online;
+			this.sample = sample;
+		}
+
+		public PlayerSample() {
+			this(0, 0, null);
+		}
 	}
 
 	public static final class ServerData {
 		public String name;
 		public int protocol;
+
+		public ServerData(String name, int protocol) {
+			this.name = name;
+			this.protocol = protocol;
+		}
+
+		public ServerData() {
+			this("", 0);
+		}
 	}
+
+	static final byte[] EMPTY_FAVICON = new byte[0];
 
 	public static final class Favicon {
 		public byte[] iconBytes;
+
+		public Favicon(byte[] iconBytes) {
+			this.iconBytes = iconBytes;
+		}
+
+		public Favicon() {
+			this(EMPTY_FAVICON);
+		}
 	}
 
 	private static AutoWrapper<PlayerSample> SAMPLE_WRAPPER;
@@ -73,7 +115,7 @@ public class ServerPingRecord implements ServerPingImpl {
 
 	private static AutoWrapper<Favicon> FAVICON_WRAPPER;
 
-	private Object description;
+	private WrappedChatComponent description;
 	private PlayerSample playerSample;
 	private ServerData serverData;
 	private Favicon favicon;
@@ -81,24 +123,21 @@ public class ServerPingRecord implements ServerPingImpl {
 	private boolean playersVisible = true;
 
 	private static ServerData defaultData() {
-		ServerData data = new ServerData();
-		data.name = MinecraftVersion.getCurrentVersion().toString();
-		data.protocol = MinecraftProtocolVersion.getCurrentVersion();
-		return data;
+		String name = MinecraftVersion.getCurrentVersion().toString();
+		int protocol = MinecraftProtocolVersion.getCurrentVersion();
+
+		return new ServerData(name, protocol);
 	}
 
 	private static PlayerSample defaultSample() {
-		PlayerSample sample = new PlayerSample();
-		sample.max = Bukkit.getMaxPlayers();
-		sample.online = Bukkit.getOnlinePlayers().size();
-		sample.sample = null;
-		return sample;
+		int max = Bukkit.getMaxPlayers();
+		int online = Bukkit.getOnlinePlayers().size();
+
+		return new PlayerSample(max, online, null);
 	}
 
 	private static Favicon defaultFavicon() {
-		Favicon favicon = new Favicon();
-		favicon.iconBytes = new byte[0];
-		return favicon;
+		return new Favicon();
 	}
 
 	public ServerPingRecord(Object handle) {
@@ -112,25 +151,13 @@ public class ServerPingRecord implements ServerPingImpl {
 		StructureModifier<Optional<Object>> optionals = structure.getOptionals(Converters.passthrough(Object.class));
 
 		Optional<Object> sampleHandle = optionals.readSafely(0);
-		if (sampleHandle.isPresent()) {
-			this.playerSample = SAMPLE_WRAPPER.wrap(sampleHandle.get());
-		} else {
-			this.playerSample = defaultSample();
-		}
+		this.playerSample = sampleHandle.isPresent() ? SAMPLE_WRAPPER.wrap(sampleHandle.get()) : defaultSample();
 
 		Optional<Object> dataHandle = optionals.readSafely(1);
-		if (dataHandle.isPresent()) {
-			this.serverData = DATA_WRAPPER.wrap(dataHandle.get());
-		} else {
-			this.serverData = defaultData();
-		}
+		this.serverData = dataHandle.isPresent() ? DATA_WRAPPER.wrap(dataHandle.get()) : defaultData();
 
 		Optional<Object> faviconHandle = optionals.readSafely(2);
-		if (faviconHandle.isPresent()) {
-			this.favicon = FAVICON_WRAPPER.wrap(faviconHandle.get());
-		} else {
-			this.favicon = defaultFavicon();
-		}
+		this.favicon = faviconHandle.isPresent() ? FAVICON_WRAPPER.wrap(faviconHandle.get()) : defaultFavicon();
 
 		this.enforceSafeChat = structure.getBooleans().readSafely(0);
 	}
@@ -139,16 +166,18 @@ public class ServerPingRecord implements ServerPingImpl {
 		initialize();
 
 		this.description = DEFAULT_DESCRIPTION;
+		this.playerSample = defaultSample();
+		this.serverData = defaultData();
 		this.favicon = defaultFavicon();
 	}
 
 	@Override
-	public Object getMotD() {
+	public WrappedChatComponent getMotD() {
 		return description;
 	}
 
 	@Override
-	public void setMotD(Object description) {
+	public void setMotD(WrappedChatComponent description) {
 		this.description = description;
 	}
 
@@ -173,13 +202,28 @@ public class ServerPingRecord implements ServerPingImpl {
 	}
 
 	@Override
-	public Object getPlayers() {
-		return playerSample;
+	public ImmutableList<WrappedGameProfile> getPlayers() {
+		if (playerSample.sample == null) {
+			return ImmutableList.of();
+		}
+
+		List<WrappedGameProfile> list = PROFILE_LIST_CONVERTER.getSpecific(playerSample.sample);
+		if (list == null) {
+			return ImmutableList.of();
+		}
+
+		return ImmutableList.copyOf(list);
 	}
 
 	@Override
-	public void setPlayers(Object playerSample) {
-		this.playerSample.sample = playerSample;
+	public void setPlayers(Iterable<? extends WrappedGameProfile> playerSample) {
+		if (playerSample == null) {
+			this.playerSample.sample = null;
+			return;
+		}
+
+		List<WrappedGameProfile> list = Converters.toList(playerSample);
+		this.playerSample.sample = PROFILE_LIST_CONVERTER.getGeneric(list);
 	}
 
 	@Override
@@ -244,10 +288,13 @@ public class ServerPingRecord implements ServerPingImpl {
 
 	@Override
 	public Object getHandle() {
+		WrappedChatComponent wrappedDescription = description != null ? description : DEFAULT_DESCRIPTION;
+		Object descHandle = wrappedDescription.getHandle();
+
 		Optional<Object> playersHandle = Optional.ofNullable(playerSample != null ? SAMPLE_WRAPPER.unwrap(playerSample) : null);
 		Optional<Object> versionHandle = Optional.ofNullable(serverData != null ? DATA_WRAPPER.unwrap(serverData) : null);
 		Optional<Object> favHandle = Optional.ofNullable(favicon != null ? FAVICON_WRAPPER.unwrap(favicon) : null);
 
-		return PING_CTOR.invoke(description, playersHandle, versionHandle, favHandle, enforceSafeChat);
+		return PING_CTOR.invoke(descHandle, playersHandle, versionHandle, favHandle, enforceSafeChat);
 	}
 }
